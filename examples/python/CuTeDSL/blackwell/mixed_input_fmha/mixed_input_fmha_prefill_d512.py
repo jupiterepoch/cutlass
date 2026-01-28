@@ -81,6 +81,7 @@ class MixedInputFusedMultiHeadAttentionPrefillD512:
         self.scale_granularity = scale_granularity
         self.iterations_qk = self.cta_tiler[2] // self.qk_mma_tiler[2]
         self.iterations_pv = self.cta_tiler[2] // self.pv_mma_tiler[1]
+        print(f"iterations_qk: {self.iterations_qk}, iterations_pv: {self.iterations_pv}")
         self.cluster_shape_mn = (2, 1)  # use 2x1 cluster by default
         self.tmem_warp_shape_mn = (4, 1)
         self.is_persistent = is_persistent

@@ -336,6 +336,9 @@ class PersistentDenseGemmKernel:
             mma_inst_shape_k * mma_inst_tile_k,
         )
         self.cta_tile_shape_mnk = (
+            # thr_id is a layout that map thread_idx to the tile owned by thread
+            # thr_id.shape -> how many participants required to cover the MMA
+            # cute.size(tiled_mma.thr_id.shape) = 2 if 2CTA else 1
             self.mma_tiler[0] // cute.size(tiled_mma.thr_id.shape),
             self.mma_tiler[1],
             self.mma_tiler[2],
@@ -345,13 +348,17 @@ class PersistentDenseGemmKernel:
         self.cluster_layout_vmnk = cute.tiled_divide(
             cute.make_layout((*self.cluster_shape_mn, 1)),
             (tiled_mma.thr_id.shape,),
-        )
+        )  # splits the first shape dim into 2 parts, (num_cta, m/num_cta), the v dim tells which CTA it is
 
         # Compute number of multicast CTAs for A/B
-        self.num_mcast_ctas_a = cute.size(self.cluster_layout_vmnk.shape[2])
-        self.num_mcast_ctas_b = cute.size(self.cluster_layout_vmnk.shape[1])
+        self.num_mcast_ctas_a = cute.size(self.cluster_layout_vmnk.shape[2])  # n
+        self.num_mcast_ctas_b = cute.size(self.cluster_layout_vmnk.shape[1])  # m/num_cta
         self.is_a_mcast = self.num_mcast_ctas_a > 1
         self.is_b_mcast = self.num_mcast_ctas_b > 1
+        # pre_divide_shape = cute.make_layout((*self.cluster_shape_mn, 1)).shape
+        # print(f"pre-divide shape: {pre_divide_shape}")
+        print(f"cluster_layout_vmnk: {self.cluster_layout_vmnk}")
+        print(f"num_mcast_ctas_a: {self.num_mcast_ctas_a}, num_mcast_ctas_b: {self.num_mcast_ctas_b}")
 
         # Compute epilogue subtile
         if cutlass.const_expr(self.use_tma_store):
@@ -454,6 +461,7 @@ class PersistentDenseGemmKernel:
         self._setup_attributes()
 
         atom_thr_size = cute.size(tiled_mma.thr_id.shape)
+        print(f"atom_thr_size: {atom_thr_size}")
 
         # Setup TMA load for A
         a_op = utils.sm100.cluster_shape_to_tma_atom_A(
@@ -601,7 +609,13 @@ class PersistentDenseGemmKernel:
 
         # Initialize mainloop ab_pipeline (barrier) and states
         ab_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
-        num_tma_producer = self.num_mcast_ctas_a + self.num_mcast_ctas_b - 1
+        # A-holding CTAs (num_mcast_ctas_a = cluster_N): A is TMA-loaded into the SMEM of the V=0 leader CTA, then multicast across the N-direction (mode[2]). Each of the cluster_N N-position leader CTAs independently holds A in its SMEM.
+        # B-holding CTAs (num_mcast_ctas_b = T = thr_id_size): B is TMA-loaded by the leader (V=0) and multicast across the cooperative V-group (mode[1]). All T CTAs in the V-group hold B in their own SMEM.
+        print(f"num_mcast_ctas_a: {self.num_mcast_ctas_a}")
+        print(f"num_mcast_ctas_b: {self.num_mcast_ctas_b}")
+        # -1 because the global leader CTA does both A and B multicast
+        num_tma_producer = self.num_mcast_ctas_a + self.num_mcast_ctas_b - 1  # cluster_n + cluster_m/num_cta - 1
+        #  consumer counts the number of tma that has finished loading
         ab_pipeline_consumer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread, num_tma_producer
         )
@@ -698,14 +712,14 @@ class PersistentDenseGemmKernel:
         )
         # (bM, bN, RestM, RestN, RestL)
         gC_mnl = cute.local_tile(
-            mC_mnl, cute.slice_(self.mma_tiler, (None, None, 0)), (None, None, None)
+            mC_mnl, cute.select(self.mma_tiler, mode=[0, 1]), (None, None, None)
         )
         k_tile_cnt = cute.size(gA_mkl, mode=[3])
 
         #
         # Partition global tensor for TiledMMA_A/B/C
         #
-        thr_mma = tiled_mma.get_slice(mma_tile_coord_v)
+        thr_mma = tiled_mma.get_slice(mma_tile_coord_v)  # mma_tile_coord_v is 0 or 1, represent CTA lane
         # (MMA, MMA_M, MMA_K, RestM, RestK, RestL)
         tCgA = thr_mma.partition_A(gA_mkl)
         # (MMA, MMA_N, MMA_K, RestN, RestK, RestL)
@@ -720,15 +734,18 @@ class PersistentDenseGemmKernel:
         a_cta_layout = cute.make_layout(
             cute.slice_(cluster_layout_vmnk, (0, 0, None, 0)).shape
         )
+        print(f"a_cta_layout: {a_cta_layout}")
         # ((atom_v, rest_v), STAGE)
         # ((atom_v, rest_v), RestM, RestK, RestL)
         tAsA, tAgA = cpasync.tma_partition(
             tma_atom_a,
-            block_in_cluster_coord_vmnk[2],
-            a_cta_layout,
-            cute.group_modes(sA, 0, 3),
+            block_in_cluster_coord_vmnk[2],  # which n-position in cluster
+            a_cta_layout,  # (cluster_n)
+            cute.group_modes(sA, 0, 3),  # (MMA, MMA_M, MMA_K)
             cute.group_modes(tCgA, 0, 3),
         )
+        print(f"sA: {sA.shape}")
+        print(f"tCgA: {tCgA.shape}")
         # TMA load B partition_S/D
         b_cta_layout = cute.make_layout(
             cute.slice_(cluster_layout_vmnk, (0, None, 0, 0)).shape
@@ -737,7 +754,7 @@ class PersistentDenseGemmKernel:
         # ((atom_v, rest_v), RestM, RestK, RestL)
         tBsB, tBgB = cpasync.tma_partition(
             tma_atom_b,
-            block_in_cluster_coord_vmnk[1],
+            block_in_cluster_coord_vmnk[1],  # which m-position in cluster
             b_cta_layout,
             cute.group_modes(sB, 0, 3),
             cute.group_modes(tCgB, 0, 3),
@@ -748,6 +765,7 @@ class PersistentDenseGemmKernel:
         #
         # (MMA, MMA_M, MMA_K, STAGE)
         tCrA = tiled_mma.make_fragment_A(sA)
+        print(f"tCrA: {tCrA.shape}")
         # (MMA, MMA_N, MMA_K, STAGE)
         tCrB = tiled_mma.make_fragment_B(sB)
         # (MMA, MMA_M, MMA_N)
@@ -785,7 +803,7 @@ class PersistentDenseGemmKernel:
                 # Get tile coord from tile scheduler
                 cur_tile_coord = work_tile.tile_idx
                 mma_tile_coord_mnl = (
-                    cur_tile_coord[0] // cute.size(tiled_mma.thr_id.shape),
+                    cur_tile_coord[0] // cute.size(tiled_mma.thr_id.shape),  # 2 tiles (CTA) correspond to 1 MMA tile
                     cur_tile_coord[1],
                     cur_tile_coord[2],
                 )
@@ -794,7 +812,8 @@ class PersistentDenseGemmKernel:
                 # Slice to per mma tile index
                 #
                 # ((atom_v, rest_v), RestK)
-                tAgA_slice = tAgA[
+                print(f"tAgA: {tAgA.shape}")
+                tAgA_slice = tAgA[  # ((atom_v, rest_v), RestM, RestK, RestL)
                     (None, mma_tile_coord_mnl[0], None, mma_tile_coord_mnl[2])
                 ]
                 # ((atom_v, rest_v), RestK)
@@ -811,6 +830,7 @@ class PersistentDenseGemmKernel:
                 #
                 for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
                     # Conditionally wait for AB buffer empty
+                    # Peeking prevents going to SMEM and checking the barrier
                     handle = ab_producer.acquire_and_advance(peek_ab_empty_status)
 
                     # TMA load A/B
@@ -885,21 +905,21 @@ class PersistentDenseGemmKernel:
                     peek_ab_full_status = ab_consumer.try_wait()
 
                 #
+                # Reset the ACCUMULATE field for each tile
+                #
+                tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
+
+                #
                 # Wait for accumulator buffer empty
                 #
                 if is_leader_cta:
                     acc_pipeline.producer_acquire(acc_producer_state)
 
                 #
-                # Reset the ACCUMULATE field for each tile
-                #
-                tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
-
-                #
                 # Mma mainloop
                 #
-                for k_tile in range(k_tile_cnt):
-                    if is_leader_cta:
+                if is_leader_cta:
+                    for k_tile in range(k_tile_cnt):
                         # Conditionally wait for AB buffer full
                         handle = ab_consumer.wait_and_advance(peek_ab_full_status)
 
@@ -1068,10 +1088,11 @@ class PersistentDenseGemmKernel:
             - grid: Grid shape for kernel launch.
         :rtype: Tuple[utils.PersistentTileSchedulerParams, tuple[int, int, int]]
         """
-        c_shape = cute.slice_(cta_tile_shape_mnk, (None, None, 0))
-        gc = cute.zipped_divide(c, tiler=c_shape)
-        num_ctas_mnl = gc[(0, (None, None, None))].shape
+        c_shape = cute.slice_(cta_tile_shape_mnk, (None, None, 0))  # (m/num_cta, n)
+        gc = cute.zipped_divide(c, tiler=c_shape)  # ((m/num_cta, n), (M*num_cta/m, N/n, L))
+        num_ctas_mnl = gc[(0, (None, None, None))].shape  # (M*num_cta/m, N/n, L)
         cluster_shape_mnl = (*cluster_shape_mn, 1)
+        print(f"c_shape: {c_shape}, gc: {gc.shape}, num_ctas_mnl: {num_ctas_mnl}")
 
         tile_sched_params = utils.PersistentTileSchedulerParams(
             num_ctas_mnl, cluster_shape_mnl
@@ -1796,6 +1817,7 @@ if __name__ == "__main__":
     )
 
     args = parser.parse_args()
+    print(f"args: {args}")
 
     if len(args.mnkl) != 4:
         parser.error("--mnkl must contain exactly 4 values")

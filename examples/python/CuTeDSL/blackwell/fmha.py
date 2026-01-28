@@ -200,7 +200,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         self.tmem_s1_offset = 128
         self.tmem_o0_offset = 256
         self.tmem_o1_offset = 384
-        self.tmem_p0_offset = 32
+        self.tmem_p0_offset = 32 # because atom width is 32 minimum, and the left part stores the 2 vec columns
         self.tmem_p1_offset = 160
 
         # vec buffer for row_max & row_sum
@@ -477,6 +477,19 @@ class BlackwellFusedMultiHeadAttentionForward:
             o_smem_layout,
             self.epi_tile,
         )
+
+        # print all shapes and layouts
+        print("q_smem_layout_staged: ", q_smem_layout_staged)
+        print("k_smem_layout_staged: ", k_smem_layout_staged)
+        print("p_tmem_layout_staged: ", p_tmem_layout_staged)
+        print("v_smem_layout_staged: ", v_smem_layout_staged)
+        print("o_smem_layout_staged: ", o_smem_layout_staged)
+        print("o_smem_layout: ", o_smem_layout)
+        cute.printf(f"tma_tensor_q: {tma_tensor_q.shape}")
+        cute.printf(f"tma_tensor_k: {tma_tensor_k.shape}")
+        cute.printf(f"tma_tensor_v: {tma_tensor_v.shape}")
+        cute.printf(f"tma_tensor_o: {tma_tensor_o.shape}")
+
 
         q_copy_size = cute.size_in_bytes(self.q_dtype, q_smem_layout)
         k_copy_size = cute.size_in_bytes(self.k_dtype, k_smem_layout)
@@ -800,6 +813,18 @@ class BlackwellFusedMultiHeadAttentionForward:
         # ///////////////////////////////////////////////////////////////////////////////
         if warp_idx == self.empty_warp_id:
             cute.arch.setmaxregister_decrease(self.num_regs_other)
+            bidx, bidy, bidz = cute.arch.block_idx()
+            if bidx == 0 and bidy == 0 and bidz == 0 and tidx % 32 == 0:
+                cute.printf(f"sO: {sO.shape}")
+                cute.printf(f"tStS: {tStS.shape}")
+                cute.printf(f"tStS0: {tStS0.shape}")
+                cute.printf(f"tStS1: {tStS1.shape}")
+                cute.printf(f"tOtO: {tOtO.shape}")
+                cute.printf(f"tOtO0: {tOtO0.shape}")
+                cute.printf(f"tOtO1: {tOtO1.shape}")
+                cute.printf(f"tP: {tP.shape}")
+                cute.printf(f"qk_acc_shape: {qk_acc_shape}")
+                cute.printf(f"pv_acc_shape: {pv_acc_shape}")
 
         # ///////////////////////////////////////////////////////////////////////////////
         #  LOAD
@@ -815,6 +840,13 @@ class BlackwellFusedMultiHeadAttentionForward:
             while work_tile.is_valid_tile:
                 curr_block_coord = work_tile.tile_idx
                 batch_coord = curr_block_coord[2][1]
+
+                # curr_block_coord
+                # curr_block_coord[0] = which q sequence tile (seq_q // cta_tiler[0])
+                # curr_block_coord[1] = which k sequence, init to 0, loop over k sequence later
+                # curr_block_coord[2] = (which q head, batch index)
+                # cute.printf(f"curr_block_coord: {curr_block_coord}")
+
                 continue_cond = False
                 cuseqlen_q = Int32(0)
                 seqlen_q = mQ_qdl.shape[0]
@@ -842,9 +874,9 @@ class BlackwellFusedMultiHeadAttentionForward:
                         )
                         mQ_qdl_ = cute.domain_offset(logical_offset_mQ, mQ_qdl)
                         curr_block_coord_q = (
-                            curr_block_coord[0],
+                            curr_block_coord[0],  # which q sequence
                             curr_block_coord[1],
-                            (curr_block_coord[2][0], Int32(0)),
+                            (curr_block_coord[2][0], Int32(0)),  # always batch 0 for varlen
                         )
 
                     if cutlass.const_expr(cum_seqlen_k is not None):
@@ -865,7 +897,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                         curr_block_coord_kv = (
                             curr_block_coord[0],
                             curr_block_coord[1],
-                            (curr_block_coord[2][0], Int32(0)),
+                            (curr_block_coord[2][0], Int32(0)),  # always batch 0 for varlen
                         )
 
                     # Local tile partition global tensors
@@ -877,11 +909,21 @@ class BlackwellFusedMultiHeadAttentionForward:
                     tQsQ, tQgQ_qdl = cute.nvgpu.cpasync.tma_partition(
                         tma_atom_q,
                         0,  # no multicast
-                        cute.make_layout(1),
-                        cute.group_modes(sQ, 0, 3),
+                        cute.make_layout(1),  # cta layout
+                        cute.group_modes(sQ, 0, 3),  # sQ layout without stage
                         cute.group_modes(tSgQ_qdl, 0, 3),
                     )
-                    tQgQ = tQgQ_qdl[None, None, 0, curr_block_coord_q[2]]
+                    tQgQ = tQgQ_qdl[None, None, 0, curr_block_coord_q[2]]  # TMA tile, loopM, loopK, (H, B)
+
+                    bidx, bidy, bidz = cute.arch.block_idx()
+                    if tidx == 32 * self.load_warp_id and bidx == 0 and bidy == 0 and bidz == 0:
+                        cute.printf(f"sQ: {sQ.shape}")              # ((128, 16), 1, (4, 2), 2)
+                        cute.printf(f"tSrQ: {tSrQ.shape}")          # (1, 1, (4, 2), 2)
+                        cute.printf(f"gQ_qdl: {gQ_qdl.shape}")      # (128,128,2,1,((1,8),1))
+                        cute.printf(f"tSgQ_qdl: {tSgQ_qdl.shape}")  # ((128,16),1,8,2,1,((1,8),1))
+                        cute.printf(f"tQsQ: {tQsQ.shape}")          # ((8192, 2), 2)
+                        cute.printf(f"tQgQ_qdl: {tQgQ_qdl.shape}")  # (((64,128),2),2,1,((1,8),1))
+                        cute.printf(f"tQgQ: {tQgQ.shape}")          # (((64,128),2),2)
 
                     gK_kdl = cute.flat_divide(
                         mK_kdl_, cute.select(self.qk_mma_tiler, mode=[1, 2])
@@ -914,8 +956,8 @@ class BlackwellFusedMultiHeadAttentionForward:
                     q0_handle = load_q_producer.acquire_and_advance()
                     cute.copy(
                         tma_atom_q,
-                        tQgQ[None, q0_coord],
-                        tQsQ[None, q0_handle.index],
+                        tQgQ[None, q0_coord],  # TMA tile, loopM
+                        tQsQ[None, q0_handle.index],  # TMA tile, stage
                         tma_bar_ptr=q0_handle.barrier,
                     )
                     # K0
@@ -1028,16 +1070,16 @@ class BlackwellFusedMultiHeadAttentionForward:
                     # GEMM_QK00 (Q0 * K0 -> S0)
                     # 1. wait for Q0
                     q0_handle = load_q_consumer.wait_and_advance()
-                    tSrQ0 = tSrQ[None, None, None, q0_handle.index]
+                    tSrQ0 = tSrQ[None, None, None, q0_handle.index]  # (MMA, MMA_M, MMA_K, Stage)
                     # 2. wait for K0
                     k_handle = load_kv_consumer.wait_and_advance()
-                    tSrK0 = tSrK[None, None, None, k_handle.index]
+                    tSrK0 = tSrK[None, None, None, k_handle.index]  # (MMA, MMA_N, MMA_K, Stage)
                     # 3. acquire empty S0 buffer
                     s0_handle = mma_s0_producer.acquire_and_advance()
                     # 4. gemm
-                    num_kphases = cute.size(tSrQ0, mode=[2])
+                    num_kphases = cute.size(tSrQ0, mode=[2])  # MMA_K
                     for kphase_idx in cutlass.range(num_kphases, unroll_full=True):
-                        kphase_coord = (None, None, kphase_idx)
+                        kphase_coord = (None, None, kphase_idx)  # (MMA_M, MMA_N, MMA_K)
                         qk_tiled_mma.set(tcgen05.Field.ACCUMULATE, kphase_idx != 0)
                         cute.gemm(
                             qk_tiled_mma,
@@ -1517,7 +1559,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                             tiled_tmem_load_vec, tTMEM_LOAD_VECtS1, tTMEM_LOAD_VECrS
                         )
                         scale_ = scale_softmax_log2 * (
-                            tTMEM_LOAD_VECrS[0] - tTMEM_LOAD_VECrS[1]
+                            tTMEM_LOAD_VECrS[0] - tTMEM_LOAD_VECrS[1]  # old max - new max
                         )
                         scale = cute.math.exp2(scale_, fastmath=True)
                         o1_handle = mma_corr_consumer.wait_and_advance()
@@ -1677,6 +1719,17 @@ class BlackwellFusedMultiHeadAttentionForward:
         tTMEM_STORE_VECcS = thr_tmem_store_vec.partition_S(tScS_vec)
         tTMEM_STOREcS = thr_tmem_store.partition_S(tScS_P)
 
+        bidx, bidy, bidz = cute.arch.block_idx()
+        tidx, _, _ = cute.arch.thread_idx()
+        if bidx == 0 and bidy == 0 and bidz == 0 and tidx % 128 == 0 and stage == 0:
+            cute.printf(f"cS: {cS.shape}")
+            cute.printf(f"tScS: {tScS.shape}")
+            cute.printf(f"tScS_vec: {tScS_vec.shape}")
+            cute.printf(f"tScS_P: {tScS_P.shape}")
+            cute.printf(f"tTMEM_LOADcS: {tTMEM_LOADcS.shape}")
+            cute.printf(f"tTMEM_STORE_VECcS: {tTMEM_STORE_VECcS.shape}")
+            cute.printf(f"tTMEM_STOREcS: {tTMEM_STOREcS.shape}")
+
         # Wait for Si
         si_handle = mma_si_consumer.wait_and_advance()
         tTMEM_LOADrS = cute.make_rmem_tensor(tTMEM_LOADcS.shape, self.qk_acc_dtype)
@@ -1727,6 +1780,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         tTMEM_STORErS_x4_e_frg = cute.logical_divide(
             tTMEM_STORErS_x4_e, cute.make_layout(frg_tile)
         )
+        # calculate P iin 4 fragments
         for j in range(frg_cnt):
             for k in cutlass.range(
                 cute.size(tTMEM_LOADrS_frg, mode=[0]), vectorize=True
@@ -1750,14 +1804,16 @@ class BlackwellFusedMultiHeadAttentionForward:
         # Notify tensor core warp that softmax(S->P) is ready
         si_handle.release()
 
+
+        # rescale old row_sum and calculate new row_sum, row_sum live in registers until the end of kv loop
         vec_i_handle = si_corr_producer.acquire_and_advance()
         acc_scale_ = scale * (old_row_max - row_max_safe)
         acc_scale = cute.math.exp2(acc_scale_, fastmath=True) * 0.5
-        row_sum *= acc_scale
-        local_row_sum_0 = (row_sum, row_sum)
+        row_sum *= acc_scale  # 0.5 in scale let row_sum becomes half
+        local_row_sum_0 = (row_sum, 0.0)
         local_row_sum_1 = (0.0, 0.0)
         local_row_sum_2 = (0.0, 0.0)
-        local_row_sum_3 = (0.0, 0.0)
+        local_row_sum_3 = (0.0, row_sum)
 
         reduction_unroll = 4
         frg_tile = cute.size(tTMEM_LOADrS) // reduction_unroll
@@ -1858,6 +1914,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         :type fused_mask: fmha_utils.FusedMask
         """
         tidx, _, _ = cute.arch.thread_idx()
+        # thread_idx is warpgroup thread index
         thread_idx = tidx % (
             self.threads_per_warp
             * (
@@ -1869,9 +1926,10 @@ class BlackwellFusedMultiHeadAttentionForward:
 
         cS_base = cute.make_identity_tensor(
             (self.qk_mma_tiler[0], self.qk_mma_tiler[1])
-        )
+        )  # used to index the MMA outputs
         tilePlikeFP32 = self.qk_mma_tiler[1] // 32 * self.o_dtype.width
         tScS = qk_thr_mma.partition_C(cS_base)
+        # composition is need to ensure conguence (thread ownership pattern preserved), so that the fragment (register) view is same
         tStS_vec_layout = cute.composition(tStS.layout, cute.make_layout((128, 2)))
         tmem_vec_offset = self.tmem_vec0_offset if stage == 0 else self.tmem_vec1_offset
         tStS_vec = cute.make_tensor(tStS.iterator + tmem_vec_offset, tStS_vec_layout)
@@ -1883,7 +1941,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         tmem_p_offset = self.tmem_p0_offset if stage == 0 else self.tmem_p1_offset
         tStS_P = cute.make_tensor(tStS.iterator + tmem_p_offset, tStS_P_layout)
         tmem_load_atom = cute.make_copy_atom(
-            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)),
+            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)),  # 32 rows,
             self.qk_acc_dtype,
         )
         tiled_tmem_load = tcgen05.make_tmem_copy(tmem_load_atom, tStSi)
@@ -1912,6 +1970,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         tiled_tmem_store = tcgen05.make_tmem_copy(tmem_store_atom, tStS_P)
         thr_tmem_store = tiled_tmem_store.get_slice(thread_idx)
         tTMEM_STOREtS_x4 = thr_tmem_store.partition_D(tStS_P)
+        cute.printf(f"tTMEM_STOREtS_x4: {tTMEM_STOREtS_x4.shape}")
 
         tile_sched = fmha_utils.create_fmha_static_tile_scheduler(
             tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
@@ -2163,7 +2222,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         )
 
         tOtO_i_layout = cute.composition(
-            tOtO.layout, cute.make_layout((128, corr_tile_size))
+            tOtO.layout, cute.make_layout((128, corr_tile_size))  # 128 so that each thread just load 1 row
         )
         tOcO_i_layout = cute.composition(
             tOcO.layout, cute.make_layout((128, corr_tile_size))
@@ -2711,7 +2770,8 @@ def run(
     print("Compiling kernel with cute.compile ...")
     start_time = time.time()
     # compile fmha kernel
-    compiled_fmha = cute.compile(
+    compile_options = (cute.GenerateLineInfo(True), cute.KeepPTX(True))
+    compiled_fmha = cute.compile[compile_options](
         fmha,
         q_tensor.iterator,
         k_tensor.iterator,

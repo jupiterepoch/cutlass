@@ -197,6 +197,15 @@ class MixedInputFusedMultiHeadAttentionPrefillD256:
         )
         scale_v = cute.make_tensor(scale_v_iter, scale_v_layout)
 
+        cute.printf(f"{q.layout}")
+        print(f"{q.layout}")
+        cute.printf(f"{k.layout}")
+        print(f"{k.layout}")
+        cute.printf(f"{v.layout}")
+        print(f"{v.layout}")
+        cute.printf(f"{o.layout}")
+        print(f"{o.layout}")
+
         self.q_dtype = q.element_type
         self.k_dtype = k.element_type
         self.v_dtype = v.element_type
@@ -1733,6 +1742,7 @@ def run(
     scale_softmax_log2 = scale_softmax * log2_e
     scale_output = scale_v * inv_scale_o
     problem_size = (b, s_q, s_k, h_q, h_k, d)
+    print(type(problem_size[0]))
     compiled_fmha = cute.compile(
         fmha,
         q_tensor.iterator,

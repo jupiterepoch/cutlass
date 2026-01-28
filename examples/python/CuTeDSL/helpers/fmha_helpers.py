@@ -227,7 +227,7 @@ class FmhaStaticTileScheduler:
         # cur_tile_coord is (mid, 0, (bid, hid))
         cur_tile_coord = (
             blk_coord[0],
-            0,
+            0,  # init to 0 for kv loop to calculate later
             (blk_coord[1], blk_coord[2]),
         )
 
@@ -934,7 +934,6 @@ class FusedMask:
         :type window_size_right: Optional[int]
         """
 
-        tidx, tidy, tidx = cute.arch.thread_idx()
         offset = 0
         offset = (
             seqlen_k - seqlen_q

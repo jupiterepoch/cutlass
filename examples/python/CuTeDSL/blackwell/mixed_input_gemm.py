@@ -200,6 +200,7 @@ class MixedInputGemmKernel:
         self.tma_warp_id = 5
         self.scale_tma_warp_id = 6
         # 4 warps to do the transformation
+        # A might be in TMEM, so has to use 4 warps to do transformation
         self.transform_warp_id = (
             8,
             9,

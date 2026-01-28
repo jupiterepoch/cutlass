@@ -59,7 +59,7 @@ class SharedStorage:
 def kernel(
     tiled_mma: cute.TiledMma,
     tma_atom_a: cute.CopyAtom,
-    mA_mkl: cute.Tensor,
+    mA_mkl: cute.Tensor, # l is the batch dimension
     tma_atom_b: cute.CopyAtom,
     mB_nkl: cute.Tensor,
     mC_mnl: cute.Tensor,
@@ -83,7 +83,7 @@ def kernel(
     sA = smem.allocate_tensor(
         element_type=io_dtype,
         layout=a_smem_layout.outer,
-        byte_alignment=128,
+        byte_alignment=128, # hardware requirement by TMA
         swizzle=a_smem_layout.inner,
     )
     sB = smem.allocate_tensor(
@@ -132,12 +132,17 @@ def kernel(
     ).make_participants()
 
     # Partition tensors for MMA and make fragments
-    # (bM, bK, RestK)
-    gA = cute.local_tile(mA_mkl, mma_tiler_mnk, mma_coord_mnk, proj=(1, None, 1))
+    # (bM, bK, RestK) = (128, 64, 128)
+    gA = cute.local_tile(mA_mkl, mma_tiler_mnk, mma_coord_mnk, proj=(1, None, 1)) # projects m and k dimensions
     # (bN, bK, RestK)
     gB = cute.local_tile(mB_nkl, mma_tiler_mnk, mma_coord_mnk, proj=(None, 1, 1))
     # (bM, bN)
     gC = cute.local_tile(mC_mnl, mma_tiler_mnk, mma_coord_mnk, proj=(1, 1, None))
+    if tidx == 0:
+        cute.printf(f"gA: {gA.shape}")
+        cute.printf(f"gB: {gB.shape}")
+        cute.printf(f"gC: {gC.shape}")
+    
     thr_mma = tiled_mma.get_slice(0)
     # (MMA, MMA_M, MMA_K)
     tCgA = thr_mma.partition_A(gA)
@@ -180,7 +185,8 @@ def kernel(
     # (EpiTile)
     epi_tiler = (
         (cute.size(tCtAcc, mode=[0, 0]), cute.size(tCtAcc, mode=[0, 1]) // subtile_cnt),
-    )
+    )  # (128, 64) = (128, 256//4)
+    # cute.printf(f"epi_tiler: {epi_tiler}")
     # (EpiTile, NumTiles)
     tCtAcc_epi = cute.zipped_divide(tCtAcc, epi_tiler)
     # (EpiTile, NumTiles)
@@ -376,7 +382,7 @@ def run_dense_gemm(
     c = make_tensors(m, n, cutlass_torch.dtype(io_dtype))
     a_tensor = (
         from_dlpack(a, assumed_align=32)
-        .mark_layout_dynamic(leading_dim=1)
+        .mark_layout_dynamic(leading_dim=1) # the dimension 1 (k for A and B) is the contiguous dimension
         .mark_compact_shape_dynamic(mode=1, divisibility=k)
     )
     b_tensor = (
